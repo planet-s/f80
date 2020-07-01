@@ -1,7 +1,11 @@
 #![cfg_attr(not(test), no_std)]
-#![cfg_attr(feature = "asm", feature(asm))]
+#![feature(asm)]
 
 use core::fmt;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64.rs"]
+mod sys;
 
 /// An 80-bit float, internally stored using one 128-bit integer. This lets you
 /// convert it back and forth from f64, and extract various parts of the type.
@@ -64,75 +68,28 @@ impl f80 {
     }
 
     pub fn to_f64(self) -> f64 {
-        #[cfg(all(feature = "asm", target_arch = "x86_64"))]
-        { self.x86_f80_to_f64() }
+        let bytes: [u8; 16];
+        let start: usize;
 
-        #[cfg(not(all(feature = "asm", target_arch = "x86_64")))]
-        { self.emulate_f80_to_f64() }
+        if cfg!(target_endian = "big") {
+            bytes = self.bits.to_ne_bytes();
+            start = 6;
+        } else {
+            bytes = self.bits.to_ne_bytes();
+            start = 0;
+        }
+
+        let mut float = 0f64;
+        unsafe {
+            sys::load_f80_into_f64(bytes[start..].as_ptr(), &mut float);
+        }
+
+        float
     }
 }
 impl fmt::Debug for f80 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "f80({sign:+} * {int:01b}.{frac:063b} * 2^({exp:+}))", sign = if self.sign() { -1 } else { 1 }, exp = self.exp(), int = self.int() as u8, frac = self.fraction())
-    }
-}
-
-impl f80 {
-    #[cfg(all(feature = "asm", target_arch = "x86_64"))]
-    fn x86_f80_to_f64(self) -> f64 {
-        let mut float = 0f64;
-        unsafe {
-            asm!("
-                  fld TBYTE PTR [{}]
-                  fstp QWORD PTR [{}]
-                ", in(reg) (&self.bits), in(reg) (&mut float));
-        }
-        float
-    }
-    #[allow(dead_code)]
-    fn emulate_f80_to_f64(self) -> f64 {
-        // Handle special cases
-        if self.exp_bits() == 0x7FFF {
-            match self.mantissa() >> (64 - 2) {
-                0b00 | 0b10 => return if self.mantissa() == 0 {
-                    f64::INFINITY
-                } else {
-                    f64::NAN
-                },
-                0b01 | 0b11 => return f64::NAN,
-                _ => unreachable!("all 2-bit cases should be handled"),
-            }
-        }
-
-        // Truncate fraction
-        let mut fraction = self.fraction() as u64;
-        fraction >>= 64 - 53;
-
-        // Convert f80 bias to f64 bias in exponent
-        let mut exp = self.exp() as u64;
-        let f64_bias = (1 << 10) - 1; // mentioned as 1023 in Wikipedia
-        exp += f64_bias;
-
-        // Get sign
-        let sign = self.sign() as u64;
-
-        // --- All parts done, assemble f64 ---
-
-        let mut output = 0;
-
-        // Push sign
-        output |= sign;
-
-        // Push exponent
-        output <<= 11;
-        output |= exp & ((1 << 11) - 1);
-
-        // Push fraction. The explicit integer part of f80 is ignored, because
-        // the f64 fraction implies there's an integer part of 1.
-        output <<= 52;
-        output |= fraction & ((1 << 52) - 1);
-
-        f64::from_bits(output)
     }
 }
 
@@ -163,27 +120,13 @@ mod tests {
     #[test]
     fn hardcoded_examples() {
         // sqrt(64)
-        let sqrt64 = f80::from_bits(302277571763841567555584).emulate_f80_to_f64();
+        let sqrt64 = f80::from_bits(302277571763841567555584).to_f64();
         println!("sqrt(64) = {}", sqrt64);
         assert!((sqrt64 - 8.0).abs() < EPSILON);
 
         // sqrt(32)
-        let sqrt32 = f80::from_bits(302262945465556336010372).emulate_f80_to_f64();
+        let sqrt32 = f80::from_bits(302262945465556336010372).to_f64();
         println!("sqrt(32) = {}", sqrt32);
         assert!((sqrt32 - 5.65685424949238).abs() < EPSILON);
-    }
-
-    proptest::proptest! {
-        #[test]
-        #[cfg(all(target_arch = "x86_64", feature = "asm"))]
-        fn emulated_works(n in 0..=u128::MAX) {
-            let f = f80::from_bits(n);
-            let expected = f.x86_f80_to_f64();
-            let actual = f.emulate_f80_to_f64();
-            println!("---");
-            println!("expected: {}", expected);
-            println!("actual: {}", actual);
-            proptest::prop_assert!(actual - expected < EPSILON);
-        }
     }
 }

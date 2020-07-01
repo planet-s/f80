@@ -6,7 +6,3 @@ edition = "2018"
 
 [features]
 default = []
-asm = []
-
-[dev-dependencies]
-proptest = "0.10.0"
