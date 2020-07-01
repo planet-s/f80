@@ -1,5 +1,5 @@
-#![cfg_attr(test, feature(asm))]
-// #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(feature = "asm", feature(asm))]
 
 use core::fmt;
 
@@ -38,6 +38,10 @@ impl f80 {
         (self.bits & mask) >> start
     }
 
+    /// Extract the entire mantissa
+    pub fn mantissa(self) -> u64 {
+        self.range(0, 64) as u64 // 64-0 = 64 => always fits 64 bits
+    }
     /// Extract the fraction part of the mantissa
     pub fn fraction(self) -> u64 {
         self.range(0, 63) as u64 // 63-0 = 63 => always fits 64 bits
@@ -60,6 +64,46 @@ impl f80 {
     }
 
     pub fn to_f64(self) -> f64 {
+        #[cfg(all(feature = "asm", target_arch = "x86_64"))]
+        { self.x86_f80_to_f64() }
+
+        #[cfg(not(all(feature = "asm", target_arch = "x86_64")))]
+        { self.emulate_f80_to_f64() }
+    }
+}
+impl fmt::Debug for f80 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "f80({sign:+} * {int:01b}.{frac:063b} * 2^({exp:+}))", sign = if self.sign() { -1 } else { 1 }, exp = self.exp(), int = self.int() as u8, frac = self.fraction())
+    }
+}
+
+impl f80 {
+    #[cfg(all(feature = "asm", target_arch = "x86_64"))]
+    fn x86_f80_to_f64(self) -> f64 {
+        let mut float = 0f64;
+        unsafe {
+            asm!("
+                  fld TBYTE PTR [{}]
+                  fstp QWORD PTR [{}]
+                ", in(reg) (&self.bits), in(reg) (&mut float));
+        }
+        float
+    }
+    #[allow(dead_code)]
+    fn emulate_f80_to_f64(self) -> f64 {
+        // Handle special cases
+        if self.exp_bits() == 0x7FFF {
+            match self.mantissa() >> (64 - 2) {
+                0b00 | 0b10 => return if self.mantissa() == 0 {
+                    f64::INFINITY
+                } else {
+                    f64::NAN
+                },
+                0b01 | 0b11 => return f64::NAN,
+                _ => unreachable!("all 2-bit cases should be handled"),
+            }
+        }
+
         // Truncate fraction
         let mut fraction = self.fraction() as u64;
         fraction >>= 64 - 53;
@@ -91,16 +135,12 @@ impl f80 {
         f64::from_bits(output)
     }
 }
-impl fmt::Debug for f80 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "f80({sign:+} * {int:01b}.{frac:063b} * 2^({exp:+}))", sign = if self.sign() { -1 } else { 1 }, exp = self.exp(), int = self.int() as u8, frac = self.fraction())
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::f80;
+
+    const EPSILON: f64 = 0.000001;
 
     #[test]
     fn range() {
@@ -123,75 +163,27 @@ mod tests {
     #[test]
     fn hardcoded_examples() {
         // sqrt(64)
-        let sqrt64 = f80::from_bits(302277571763841567555584).to_f64();
+        let sqrt64 = f80::from_bits(302277571763841567555584).emulate_f80_to_f64();
         println!("sqrt(64) = {}", sqrt64);
-        assert!((sqrt64 - 8.0).abs() < std::f64::EPSILON);
+        assert!((sqrt64 - 8.0).abs() < EPSILON);
 
         // sqrt(32)
-        let sqrt32 = f80::from_bits(302262945465556336010372).to_f64();
+        let sqrt32 = f80::from_bits(302262945465556336010372).emulate_f80_to_f64();
         println!("sqrt(32) = {}", sqrt32);
-        assert!((sqrt32 - 5.65685424949238).abs() < std::f64::EPSILON);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn x86_64_divide(n: u64, d: u64) -> bool {
-        #[derive(Clone, Copy, Debug, Default)]
-        #[repr(packed)]
-        pub struct FloatRegisters {
-            pub fcw: u16,
-            pub fsw: u16,
-            pub ftw: u8,
-            pub _reserved0: u8,
-            pub fop: u16,
-            pub fip: u64,
-            pub fdp: u64,
-            pub mxcsr: u32,
-            pub mxcsr_mask: u32,
-            pub st_space: [u128; 8],
-            pub xmm_space: [u128; 16],
-            pub _reserved1: [u128; 3],
-            pub _available0: [u128; 3],
-        }
-
-        #[repr(align(16))]
-        pub struct Aligned(pub FloatRegisters);
-
-        let mut fx = Aligned(FloatRegisters::default());
-        let mut res: u64 = 0;
-
-        unsafe {
-            asm!("fild QWORD PTR [{}] // push n to float stack
-                  fild QWORD PTR [{}] // push d to float stack
-                  fdivp               // divide
-                  fxsave64 [{}]       // store floating point data
-                  fistp QWORD PTR [{}]
-                  ", in(reg) (&n), in(reg) (&d), in(reg) (&mut fx), in(reg) (&mut res));
-        }
-
-        let out = f80::from_bits(fx.0.st_space[fx.0.fop as usize]);
-
-        println!("{} / {} = {:?}", n, d, out);
-        println!("float value: {}", out.to_f64());
-
-        ((n as f64 / d as f64) - out.to_f64()).abs() < 0.000001
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn x86_64_divide_hardcoded() {
-        assert!(x86_64_divide(100, 1));
-        assert!(x86_64_divide(100, 2));
-
-        for _ in 0..100 {
-            assert!(x86_64_divide(184, 1));
-        }
+        assert!((sqrt32 - 5.65685424949238).abs() < EPSILON);
     }
 
     proptest::proptest! {
         #[test]
-        #[cfg(target_arch = "x86_64")]
-        fn x86_64_divide_prop(n in 100u64..1000u64, d in 1u64..100u64) {
-            proptest::prop_assert!(x86_64_divide(n, d));
+        #[cfg(all(target_arch = "x86_64", feature = "asm"))]
+        fn emulated_works(n in 0..=u128::MAX) {
+            let f = f80::from_bits(n);
+            let expected = f.x86_f80_to_f64();
+            let actual = f.emulate_f80_to_f64();
+            println!("---");
+            println!("expected: {}", expected);
+            println!("actual: {}", actual);
+            proptest::prop_assert!(actual - expected < EPSILON);
         }
     }
 }
