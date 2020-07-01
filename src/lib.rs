@@ -67,17 +67,24 @@ impl f80 {
         self.range(79, 80) == 1
     }
 
-    pub fn to_f64(self) -> f64 {
-        let bytes: [u8; 16];
-        let start: usize;
+    /// Convert f64 to f80
+    pub fn from_f64(float: f64) -> Self {
+        let mut bytes = [0; 16];
+        let start = if cfg!(target_endian = "big") { 6 } else { 0 };
 
-        if cfg!(target_endian = "big") {
-            bytes = self.bits.to_ne_bytes();
-            start = 6;
-        } else {
-            bytes = self.bits.to_ne_bytes();
-            start = 0;
+        unsafe {
+            sys::load_f64_into_f80(&float, bytes[start..].as_mut_ptr());
         }
+
+        Self {
+            bits: u128::from_ne_bytes(bytes),
+        }
+    }
+
+    /// Convert f80 to f64
+    pub fn to_f64(self) -> f64 {
+        let bytes = self.bits.to_ne_bytes();
+        let start = if cfg!(target_endian = "big") { 6 } else { 0 };
 
         let mut float = 0f64;
         unsafe {
@@ -118,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_examples() {
+    fn to_f64() {
         // sqrt(64)
         let sqrt64 = f80::from_bits(302277571763841567555584).to_f64();
         println!("sqrt(64) = {}", sqrt64);
@@ -128,5 +135,10 @@ mod tests {
         let sqrt32 = f80::from_bits(302262945465556336010372).to_f64();
         println!("sqrt(32) = {}", sqrt32);
         assert!((sqrt32 - 5.65685424949238).abs() < EPSILON);
+    }
+
+    #[test]
+    fn from_f64() {
+        assert_eq!(f80::from_f64(8.0).to_bits(), 302277571763841567555584);
     }
 }
